@@ -306,9 +306,11 @@ void NauUsdInspectorClient::buildProperties(const UsdProxy::UsdProxyPrim& proxyP
     }
     
     
+    const pxr::TfToken typeName = proxyPrim.getPrim().GetTypeName();
+
     for (auto prop : proxyPrim.getProperties()) {
         // Skip the colorRGBA property for the Button component
-        if (prop.second->getName() == pxr::TfToken("colorRGBA") && proxyPrim.getPrim().GetTypeName() == pxr::TfToken("NauGuiButton")) {
+        if (typeName == "NauGuiButton" && prop.second->getName() == pxr::TfToken("colorRGBA")) {
             continue;
         }
 
