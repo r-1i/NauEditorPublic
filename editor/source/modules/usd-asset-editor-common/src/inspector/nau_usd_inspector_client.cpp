@@ -2,24 +2,23 @@
 // Use of this source code is governed by a BSD-3 Clause license that can be found in the LICENSE file.
 
 #include "nau/inspector/nau_usd_inspector_client.hpp"
+
+#include "nau/app/nau_editor_services.hpp"
+#include "nau/assets/nau_asset_manager.hpp"
 #include "nau/inspector/nau_usd_property_factory.hpp"
+#include "nau/prim-factory/nau_usd_prim_creator.hpp"
+#include "nau/prim-factory/nau_usd_prim_factory.hpp"
+#include "nau/shared/file_system.h"
 #include "nau/utils/nau_usd_editor_utils.hpp"
 
-
-#include "pxr/usd/usdGeom/tokens.h"
 #include "pxr/usd/sdf/listEditorProxy.h"
-#include <pxr/usd/usdGeom/xformCache.h>
-
-#include "nau/assets/nau_asset_manager.hpp"
-#include "nau/app/nau_editor_services.hpp"
-#include "nau/prim-factory/nau_usd_prim_factory.hpp"
-#include "nau/prim-factory/nau_usd_prim_creator.hpp"
+#include "pxr/usd/usdGeom/tokens.h"
+#include "pxr/usd/usdGeom/xformCache.h"
 
 #include <algorithm>
 #include <memory>
 #include <utility>
 #include <vector>
-#include "nau/shared/file_system.h"
 
 // ** Helper functions
 namespace
@@ -307,40 +306,46 @@ void NauUsdInspectorClient::buildProperties(const UsdProxy::UsdProxyPrim& proxyP
             }
         }
     }
-    
-    
+
     // Properties are iterated in alphabetical order, which scatters the corner
-    // offsets of a DrawNode across the inspector. Group them together.
-    const std::vector<pxr::TfToken> cornerPropertyNames = {
-        pxr::TfToken("bottomLeftCorner"),
-        pxr::TfToken("bottomRightCorner"),
-        pxr::TfToken("upperLeftCorner"),
-        pxr::TfToken("upperRightCorner")
-    };
+    // offsets of a DrawNode across the inspector. Group them together, but only
+    // for DrawNode prims, where these properties actually exist.
+    std::vector<std::pair<pxr::TfToken, UsdProxy::UsdProxyPropertyPtr>> properties;
 
     const UsdProxy::UsdProxyPropertyMap proxyProperties = proxyPrim.getProperties();
+    if (proxyPrim.getPrim().GetTypeName() == pxr::TfToken("NauGuiDrawNode")) {
+        const std::vector<pxr::TfToken> cornerPropertyNames = {
+            pxr::TfToken("bottomLeftCorner"),
+            pxr::TfToken("bottomRightCorner"),
+            pxr::TfToken("upperLeftCorner"),
+            pxr::TfToken("upperRightCorner")
+        };
 
-    std::vector<std::pair<pxr::TfToken, UsdProxy::UsdProxyPropertyPtr>> properties;
-    properties.reserve(proxyProperties.size());
-    for (const pxr::TfToken& cornerName : cornerPropertyNames) {
-        if (auto it = proxyProperties.find(cornerName); it != proxyProperties.end()) {
-            properties.emplace_back(*it);
+        properties.reserve(proxyProperties.size());
+        for (const pxr::TfToken& cornerName : cornerPropertyNames) {
+            if (auto it = proxyProperties.find(cornerName); it != proxyProperties.end()) {
+                properties.emplace_back(*it);
+            }
         }
-    }
-    for (const auto& prop : proxyProperties) {
-        if (std::find(cornerPropertyNames.begin(), cornerPropertyNames.end(), prop.first) == cornerPropertyNames.end()) {
-            properties.emplace_back(prop);
+        for (const auto& prop : proxyProperties) {
+            if (std::find(cornerPropertyNames.begin(), cornerPropertyNames.end(), prop.first) == cornerPropertyNames.end()) {
+                properties.emplace_back(prop);
+            }
         }
+    } else {
+        properties.assign(proxyProperties.begin(), proxyProperties.end());
     }
 
-    for (auto prop : properties) {
-        // Skip the colorRGBA property for components where it has no effect:
-        // the Button color is defined by default/hovered/clicked/disable colors,
-        // the DrawNode appearance is defined by borderColorRGBA/fillColorRGBA
-        const auto primTypeName = proxyPrim.getPrim().GetTypeName();
-        if (prop.second->getName() == pxr::TfToken("colorRGBA") &&
-            (primTypeName == pxr::TfToken("NauGuiButton") || primTypeName == pxr::TfToken("NauGuiDrawNode")))
-        {
+    const auto primTypeName = proxyPrim.getPrim().GetTypeName();
+    // Skip the colorRGBA property for components where it has no effect:
+    // the Button color is defined by default/hovered/clicked/disable colors,
+    // the DrawNode appearance is defined by borderColorRGBA/fillColorRGBA
+    const bool skipColorRGBA =
+        primTypeName == pxr::TfToken("NauGuiButton") ||
+        primTypeName == pxr::TfToken("NauGuiDrawNode");
+
+    for (const auto& prop : properties) {
+        if (skipColorRGBA && prop.first == pxr::TfToken("colorRGBA")) {
             continue;
         }
 
