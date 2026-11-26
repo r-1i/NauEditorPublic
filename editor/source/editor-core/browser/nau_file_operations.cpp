@@ -6,11 +6,17 @@
 #include "nau_widget_utility.hpp"
 #include "nau_log.hpp"
 
+#include "nau/assets/nau_asset_manager.hpp"
+#include "nau/nau_editor_plugin_manager.hpp"
+
 #include <QApplication>
 #include <QRegularExpression>
 #include <QClipboard>
 #include <QMimeData>
 #include <QUrl>
+
+#include <filesystem>
+#include <system_error>
 
 
 // ** NauFileOperations
@@ -61,7 +67,10 @@ void NauFileOperations::pasteFromClipboard(const QModelIndex& parent)
 
         bool result = false;
         if (cutting) {
-            result = isDir ? movePathRecursively(srcPath, dstFileName) : QFile::rename(srcPath, dstFileName);
+            result = isDir ? movePathRecursively(srcPath, dstFileName) : moveAssetPair(srcPath, dstFileName);
+        } else if (!isDir && duplicateAssetPair(srcPath, dstPath.absolutePath())) {
+            // A paired meta is duplicated together with its source file as an independent asset.
+            result = true;
         } else {
             result = isDir ? copyPathRecursively(srcPath, dstFileName) : QFile::copy(srcPath, dstFileName);
         }
@@ -85,7 +94,11 @@ void NauFileOperations::duplicate(const QModelIndexList& indexes)
         const NauDir dstPath = QFileInfo{srcPath}.absoluteDir();
         const QString dstFileName = generateFileNameIfExists(srcPath);
 
-        const bool result = QFileInfo{srcPath}.isDir() 
+        if (duplicateAssetPair(srcPath, dstPath.absolutePath())) {
+            continue;
+        }
+
+        const bool result = QFileInfo{srcPath}.isDir()
             ? copyPathRecursively(srcPath, dstFileName)
             : QFile::copy(srcPath, dstFileName);
 
@@ -112,6 +125,72 @@ QString NauFileOperations::generateFileNameIfExists(const QString& absFilePath)
     }
 
     return result;
+}
+
+bool NauFileOperations::duplicateAssetPair(const QString& srcMetaPath, const QString& dstDir)
+{
+    static const QString metaExtension = QStringLiteral(".nausd");
+    if (!srcMetaPath.endsWith(metaExtension)) {
+        return false;
+    }
+
+    const QString srcSourcePath = QString(srcMetaPath).chopped(metaExtension.size());
+    const QFileInfo srcSourceInfo{srcSourcePath};
+    if (!srcSourceInfo.exists() || srcSourceInfo.isDir()) {
+        // Not a paired meta (e.g. a self-contained material).
+        return false;
+    }
+
+    const QString newSourcePath = generateFileNameIfExists(NauDir{dstDir}.absoluteFilePath(srcSourceInfo.fileName()));
+    const QString newMetaPath = newSourcePath + metaExtension;
+    if (QFile::exists(newMetaPath)) {
+        return false;
+    }
+
+    if (!Nau::EditorServiceProvider().get<NauAssetFileProcessorInterface>().duplicatePairedAsset(
+            srcMetaPath.toStdString(), newMetaPath.toStdString(), newSourcePath.toStdString()))
+    {
+        return false;
+    }
+
+    NED_TRACE("Duplicated asset {} to {}", srcMetaPath.toUtf8().constData(), newMetaPath.toUtf8().constData());
+    return true;
+}
+
+bool NauFileOperations::moveAssetPair(const QString& srcMetaPath, const QString& dstMetaPath)
+{
+    static const QString metaExtension = QStringLiteral(".nausd");
+    if (!srcMetaPath.endsWith(metaExtension)) {
+        return QFile::rename(srcMetaPath, dstMetaPath);
+    }
+
+    const QString srcSourcePath = QString(srcMetaPath).chopped(metaExtension.size());
+    if (!QFile::exists(srcSourcePath)) {
+        return QFile::rename(srcMetaPath, dstMetaPath);
+    }
+
+    const QString dstSourcePath = QString(dstMetaPath).chopped(metaExtension.size());
+    if (QFile::exists(dstSourcePath)) {
+        NED_WARNING("Asset source file {} already exists, moving the meta without its source",
+            dstSourcePath.toUtf8().constData());
+        return QFile::rename(srcMetaPath, dstMetaPath);
+    }
+
+    if (!QFile::rename(srcSourcePath, dstSourcePath)) {
+        return QFile::rename(srcMetaPath, dstMetaPath);
+    }
+    if (!QFile::rename(srcMetaPath, dstMetaPath)) {
+        QFile::rename(dstSourcePath, srcSourcePath);
+        return false;
+    }
+
+    // QFile::rename keeps the source file modification time, so the import pipeline would treat
+    // the moved asset as unchanged and skip updating its database record (with the new relative
+    // path). Bump the time stamp so the watcher-driven reimport updates the record.
+    std::error_code ec;
+    std::filesystem::last_write_time(dstSourcePath.toStdString(), std::filesystem::file_time_type::clock::now(), ec);
+
+    return true;
 }
 
 QString NauFileOperations::cutOperationMimeType()

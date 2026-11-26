@@ -9,6 +9,9 @@
 #include "nau_project_browser_file_system_model.hpp"
 #include "themes/nau_theme.hpp"
 
+#include "nau/assets/nau_asset_manager.hpp"
+#include "nau/nau_editor_plugin_manager.hpp"
+
 #include "magic_enum/magic_enum.hpp"
 #include "magic_enum/magic_enum_iostream.hpp"
 
@@ -108,7 +111,55 @@ bool NauProjectFileSystemProxyModel::setData(const QModelIndex& index, const QVa
 {
     if (index.isValid() && (index.column() == 0) && (role == Qt::EditRole) && flags(index).testFlag(Qt::ItemIsEditable)) {
         if (!QFileInfo{index.data(NauProjectBrowserFileSystemModel::FilePathRole).toString()}.isDir()) {
-            // Renaming a file doesn't lead to QTBUG-33720. So we can forward to the default implementation.
+            const QString oldFilePath = index.data(NauProjectBrowserFileSystemModel::FilePathRole).toString();
+            const QString newName = value.toString();
+            if (newName.isEmpty() || QDir::toNativeSeparators(newName).contains(QDir::separator())) {
+                return QSortFilterProxyModel::setData(index, value, role);
+            }
+
+            static const QString metaExtension = QStringLiteral(".nausd");
+            if (oldFilePath.endsWith(metaExtension)) {
+                // Renaming an asset meta file renames the whole asset: the paired source file is renamed
+                // as well and rebound inside the meta, so the asset keeps its uid and a single asset
+                // database record (see NauUsdAssetProcessor::ensureUniqueUid). The browser shows only
+                // meta files, so this is the primary rename path for source assets.
+                const QString newFilePath = QFileInfo{oldFilePath}.dir().absoluteFilePath(newName);
+                const QString newSourcePath = QString(newFilePath).chopped(metaExtension.size());
+                if (newFilePath != oldFilePath && !QFile::exists(newFilePath) && !QFile::exists(newSourcePath) &&
+                    Nau::EditorServiceProvider().get<NauAssetFileProcessorInterface>().renamePairedAsset(
+                        oldFilePath.toStdString(), newFilePath.toStdString()))
+                {
+                    return true;
+                }
+                // Fall through to the plain rename if the asset pair could not be renamed.
+            } else {
+                // Renaming a source file: rename the asset meta file alongside. The import pipeline
+                // derives the meta path from the source file name, so a renamed source would otherwise
+                // get a freshly generated meta (with a new uid) on the next import, duplicating the asset.
+                const QString oldMetaPath = oldFilePath + metaExtension;
+                const QString newMetaPath = QFileInfo{oldFilePath}.dir().absoluteFilePath(newName + metaExtension);
+
+                bool metaRenamed = false;
+                if (QFile::exists(oldMetaPath) && newMetaPath != oldMetaPath) {
+                    if (QFile::exists(newMetaPath)) {
+                        NED_WARNING("Asset meta file {} already exists, the source is renamed without its meta",
+                            newMetaPath.toUtf8().constData());
+                    } else if (QFile::rename(oldMetaPath, newMetaPath)) {
+                        metaRenamed = true;
+                    } else {
+                        NED_ERROR("Failed to rename the asset meta file {} to {}", oldMetaPath.toUtf8().constData(),
+                            newMetaPath.toUtf8().constData());
+                    }
+                }
+
+                // Renaming a file doesn't lead to QTBUG-33720. So we can forward to the default implementation.
+                const bool renamed = QSortFilterProxyModel::setData(index, value, role);
+                if (!renamed && metaRenamed) {
+                    QFile::rename(newMetaPath, oldMetaPath);
+                }
+                return renamed;
+            }
+
             return QSortFilterProxyModel::setData(index, value, role);
         }
 

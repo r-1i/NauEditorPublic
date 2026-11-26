@@ -24,6 +24,8 @@ public:
     void setAssetFileUid(const std::filesystem::path& assetSource) override;
     int importAsset(const std::filesystem::path& project, const std::filesystem::path& assetSource) override;
     bool ensureUniqueUid(const std::filesystem::path& assetPath) override;
+    bool renamePairedAsset(const std::filesystem::path& oldAssetMetaPath, const std::filesystem::path& newAssetMetaPath) override;
+    bool duplicatePairedAsset(const std::filesystem::path& assetMetaPath, const std::filesystem::path& newAssetMetaPath, const std::filesystem::path& newSourcePath) override;
     std::string sourcePathFromAssetFile(const std::string& assetPath) override;
 
     std::string_view assetFileFilter() const override;

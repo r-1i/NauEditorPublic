@@ -45,4 +45,12 @@ private:
 
     static QMimeData* prepareCopyCut(const QModelIndexList& indexes);
     static bool movePathRecursively(const QString& src, const QString& dst);
+
+    // Duplicates a source asset (a meta file with its paired source file) as an independent copy
+    // with unique names in dstDir. Returns false if srcMetaPath is not a paired meta, in which case
+    // the caller falls back to duplicating the file itself.
+    static bool duplicateAssetPair(const QString& srcMetaPath, const QString& dstDir);
+
+    // Moves a meta file together with its paired source file. Falls back to moving the file alone.
+    static bool moveAssetPair(const QString& srcMetaPath, const QString& dstMetaPath);
 };

@@ -33,6 +33,19 @@ public:
     // Returns false if the meta file could not be processed, in which case the import must be aborted.
     virtual bool ensureUniqueUid(const std::filesystem::path& assetPath) = 0;
 
+    // Renames a source asset file together with its meta file ("<name>.nausd"), rebinding the source
+    // references inside the meta. Both paths must be in the same directory; the paired source of
+    // oldAssetMetaPath must exist and the new paths must not. This keeps the asset uid and a single
+    // asset database record, so the rename is not mistaken for a new asset on the next import.
+    // Returns false with the files left unchanged on failure.
+    virtual bool renamePairedAsset(const std::filesystem::path& oldAssetMetaPath, const std::filesystem::path& newAssetMetaPath) = 0;
+
+    // Creates an independent copy of a source asset: copies the paired source file and exports the
+    // meta with its source references rebound to the new source file. The caller provides unique new
+    // paths; the meta copy keeps the original uid, which ensureUniqueUid replaces on import.
+    // Returns false on failure (partially created files are removed).
+    virtual bool duplicatePairedAsset(const std::filesystem::path& assetMetaPath, const std::filesystem::path& newAssetMetaPath, const std::filesystem::path& newSourcePath) = 0;
+
     // Reads asset meta file and gets source path info from it
     virtual std::string sourcePathFromAssetFile(const std::string& assetPath) = 0;
 

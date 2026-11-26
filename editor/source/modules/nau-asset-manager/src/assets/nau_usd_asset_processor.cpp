@@ -25,6 +25,7 @@
 #include <pxr/usd/usd/prim.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/attribute.h>
+#include <pxr/usd/usd/payloads.h>
 #include <pxr/usd/sdf/primSpec.h>
 #include <pxr/base/tf/token.h>
 #include <pxr/base/tf/stringUtils.h>
@@ -139,7 +140,7 @@ namespace
     // against to decide whether the asset needs recompilation. Material assets are self-contained,
     // so their source file is the meta file itself; all the other assets reference their source
     // file from the meta file.
-    std::string dirtyCheckSourcePath(const std::filesystem::path& assetPath, nau::IAssetDB& assetDb)
+    std::string dirtyCheckSourcePath(const std::filesystem::path& assetPath, nau::IAssetDB& assetDb, const nau::Uid& uid)
     {
         nau::UsdMetaInfoArray assetInfo = nau::UsdMetaManager::instance().getInfo(assetPath.string());
         if (!assetInfo.empty() && assetInfo[0].type == "material")
@@ -148,7 +149,7 @@ namespace
         }
 
         const std::string nausdRelativePath = nau::FileSystemExtensions::getRelativeAssetPath(assetPath, false).string();
-        const eastl::string sourceRelativePath = assetDb.getSourcePathFromNausdPath(nausdRelativePath.c_str());
+        eastl::string sourceRelativePath = assetDb.getSourcePathFromNausdPath(nausdRelativePath.c_str());
 
         std::string sourceAbsolutePath;
         if (!sourceRelativePath.empty())
@@ -159,12 +160,58 @@ namespace
         std::error_code ec;
         if (sourceAbsolutePath.empty() || !std::filesystem::exists(sourceAbsolutePath, ec) || std::filesystem::is_directory(sourceAbsolutePath, ec))
         {
-            // The database has no record of the meta file yet (e.g. it was renamed together with its
-            // source file), so the source file is assumed to have the same path without the meta extension.
-            sourceAbsolutePath = std::filesystem::path(assetPath).replace_extension().string();
+            // The meta file was renamed, so look the source file up by the uid instead.
+            // AssetDB lookups return an empty string for an unknown key, never throw.
+            sourceRelativePath = assetDb.getSourcePathFromUid(uid);
+            if (!sourceRelativePath.empty())
+            {
+                sourceAbsolutePath = nau::FileSystemExtensions::resolveToNativePathContentFolder(sourceRelativePath.c_str());
+            }
         }
 
         return sourceAbsolutePath;
+    }
+
+    // Rewrites all references to a source file (asset path attributes and payloads) inside a meta stage.
+    bool rewriteSourceReferences(const pxr::UsdStageRefPtr& stage, const std::string& oldFileName, const std::string& newFileName)
+    {
+        bool changed = false;
+        for (const pxr::UsdPrim& prim : stage->Traverse())
+        {
+            for (const pxr::UsdAttribute& attr : prim.GetAttributes())
+            {
+                if (attr.GetTypeName() != pxr::SdfValueTypeNames->Asset)
+                {
+                    continue;
+                }
+
+                pxr::SdfAssetPath assetPath;
+                if (attr.Get(&assetPath) && assetPath.GetAssetPath() == oldFileName)
+                {
+                    attr.Set(pxr::SdfAssetPath(newFileName));
+                    changed = true;
+                }
+            }
+
+            pxr::SdfPrimSpecHandle primSpec = stage->GetRootLayer()->GetPrimAtPath(prim.GetPath());
+            if (!primSpec)
+            {
+                continue;
+            }
+
+            const pxr::SdfPayloadVector payloadList = primSpec->GetPayloadList().GetAddedOrExplicitItems();
+            for (const pxr::SdfPayload& payload : payloadList)
+            {
+                if (payload.GetAssetPath() == oldFileName)
+                {
+                    primSpec->GetPayloadList().Remove(payload);
+                    primSpec->GetPayloadList().Add(pxr::SdfPayload(newFileName, payload.GetPrimPath(), payload.GetLayerOffset()));
+                    changed = true;
+                }
+            }
+        }
+
+        return changed;
     }
 
     bool renameAssetPrim(const pxr::UsdStageRefPtr& stage, const pxr::UsdPrim& prim, const std::string& newPrimName)
@@ -229,6 +276,7 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
         const bool isMaterial = createTypeResolver()->resolve(assetPath.string().c_str()).type == NauEditorFileType::Material;
 
         bool renamedOrMoved = false;
+        std::optional<nau::Uid> movedUid;
         std::vector<pxr::UsdPrim> movedUidPrims;
         std::vector<pxr::UsdPrim> copiedUidPrims;
 
@@ -255,6 +303,8 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
             // The uid belongs to the asset this file was copied from only if that asset's file still exists.
             // An unknown uid means a brand new asset, a missing original file means the asset was renamed or moved:
             // in both cases the uid must be kept, otherwise references to the asset are lost.
+            // Note: getNausdPathFromUid returns an empty string for an unknown uid (logging a warning),
+            // it never throws, so an empty result is handled by the checks below.
             const eastl::string registeredNausdPath = assetDb.getNausdPathFromUid(*parsedUid);
             if (registeredNausdPath.empty())
             {
@@ -276,6 +326,7 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
                 // The asset was renamed or moved: the uid is kept, but the asset must be reimported to update
                 // the path stored in the asset database.
                 renamedOrMoved = true;
+                movedUid = *parsedUid;
                 movedUidPrims.push_back(prim);
                 continue;
             }
@@ -304,17 +355,24 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
                 return false;
             }
 
-            const std::string sourcePath = dirtyCheckSourcePath(assetPath, assetDb);
+            const std::string sourcePath = dirtyCheckSourcePath(assetPath, assetDb, *movedUid);
             if (sourcePath != assetPath.string())
             {
-                std::error_code ec;
-                if (!std::filesystem::exists(sourcePath, ec) || ec)
+                if (sourcePath.empty())
                 {
-                    NED_WARNING("Source file {} of the renamed asset {} was not found, the asset database will keep the old source path", sourcePath, assetPath.string());
+                    NED_WARNING("Source file of the renamed asset {} was not found, the asset database will keep the old source path", assetPath.string());
                 }
-                else if (!touchFile(sourcePath))
+                else
                 {
-                    return false;
+                    std::error_code ec;
+                    if (!std::filesystem::exists(sourcePath, ec) || ec)
+                    {
+                        NED_WARNING("Source file {} of the renamed asset {} was not found, the asset database will keep the old source path", sourcePath, assetPath.string());
+                    }
+                    else if (!touchFile(sourcePath))
+                    {
+                        return false;
+                    }
                 }
             }
         }
@@ -325,7 +383,10 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
         {
             for (const pxr::UsdPrim& prim : movedUidPrims)
             {
-                renameAssetPrim(stage, prim, materialPrimName(assetPath));
+                if (!renameAssetPrim(stage, prim, materialPrimName(assetPath)))
+                {
+                    return false;
+                }
             }
         }
 
@@ -346,7 +407,11 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
             // would be drawn with the original material.
             if (isMaterial)
             {
-                renameAssetPrim(stage, prim, materialPrimName(assetPath, newUid.substr(0, 8)));
+                if (!renameAssetPrim(stage, prim, materialPrimName(assetPath, newUid.substr(0, 8))))
+                {
+                    NED_ERROR("Failed to rename the prim of the copied material in {}", assetPath.string());
+                    return false;
+                }
             }
         }
 
@@ -373,10 +438,86 @@ bool NauUsdAssetProcessor::ensureUniqueUid(const std::filesystem::path& assetPat
     }
 }
 
+bool NauUsdAssetProcessor::renamePairedAsset(const std::filesystem::path& oldAssetMetaPath, const std::filesystem::path& newAssetMetaPath)
+{
+    // The paired source file name is the meta file name without the meta extension.
+    const std::filesystem::path oldSourcePath = std::filesystem::path(oldAssetMetaPath).replace_extension();
+    const std::filesystem::path newSourcePath = std::filesystem::path(newAssetMetaPath).replace_extension();
+    const std::string oldFileName = oldSourcePath.filename().string();
+    const std::string newFileName = newSourcePath.filename().string();
+
+    std::error_code ec;
+    std::filesystem::rename(oldSourcePath, newSourcePath, ec);
+    if (ec)
+    {
+        NED_ERROR("Failed to rename the asset source file {} to {}: {}", oldSourcePath.string(), newSourcePath.string(), ec.message());
+        return false;
+    }
+
+    auto stage = pxr::UsdStage::Open(oldAssetMetaPath.string(), pxr::UsdStage::LoadNone);
+    if (!stage || !rewriteSourceReferences(stage, oldFileName, newFileName) || !stage->GetRootLayer()->Save())
+    {
+        NED_ERROR("Failed to rebind the asset meta file {} to the source {}", oldAssetMetaPath.string(), newFileName);
+        std::filesystem::rename(newSourcePath, oldSourcePath, ec);
+        return false;
+    }
+
+    std::filesystem::rename(oldAssetMetaPath, newAssetMetaPath, ec);
+    if (ec)
+    {
+        NED_ERROR("Failed to rename the asset meta file {} to {}: {}", oldAssetMetaPath.string(), newAssetMetaPath.string(), ec.message());
+
+        // Roll the source file and the meta content back.
+        auto rollback = pxr::UsdStage::Open(oldAssetMetaPath.string(), pxr::UsdStage::LoadNone);
+        if (rollback)
+        {
+            rewriteSourceReferences(rollback, newFileName, oldFileName);
+            rollback->GetRootLayer()->Save();
+        }
+        std::filesystem::rename(newSourcePath, oldSourcePath, ec);
+        return false;
+    }
+
+    // std::filesystem::rename preserves the source file modification time, so the import pipeline
+    // would treat the renamed asset as unchanged and skip updating its database record, leaving
+    // the stale source path in the asset database. Bump the time stamp so the watcher-driven
+    // reimport compiles the asset and updates the record by the preserved uid.
+    std::filesystem::last_write_time(newSourcePath, std::filesystem::file_time_type::clock::now(), ec);
+
+    return true;
+}
+
+bool NauUsdAssetProcessor::duplicatePairedAsset(const std::filesystem::path& assetMetaPath, const std::filesystem::path& newAssetMetaPath, const std::filesystem::path& newSourcePath)
+{
+    const std::filesystem::path sourcePath = std::filesystem::path(assetMetaPath).replace_extension();
+    const std::string oldFileName = sourcePath.filename().string();
+    const std::string newFileName = newSourcePath.filename().string();
+
+    std::error_code ec;
+    if (!std::filesystem::copy_file(sourcePath, newSourcePath, std::filesystem::copy_options::none, ec) || ec)
+    {
+        NED_ERROR("Failed to copy the asset source file {} to {}: {}", sourcePath.string(), newSourcePath.string(), ec.message());
+        return false;
+    }
+
+    // Export the meta with the source references rebound to the new source file, so the copy is an
+    // independent asset. The copy keeps the original uid: ensureUniqueUid replaces it on import.
+    auto stage = pxr::UsdStage::Open(assetMetaPath.string(), pxr::UsdStage::LoadNone);
+    if (!stage || !rewriteSourceReferences(stage, oldFileName, newFileName) ||
+        !stage->GetRootLayer()->Export(newAssetMetaPath.string()))
+    {
+        NED_ERROR("Failed to create the asset meta copy {}", newAssetMetaPath.string());
+        std::filesystem::remove(newSourcePath, ec);
+        std::filesystem::remove(newAssetMetaPath, ec);
+        return false;
+    }
+
+    return true;
+}
+
 int NauUsdAssetProcessor::importAsset(const std::filesystem::path& project, const std::filesystem::path& assetSource)
 {
     auto args = std::make_unique<nau::ImportAssetsArguments>();
-
     args->projectPath = project.string();
     if (!assetSource.string().empty()) {
         args->assetPath = assetSource.string();
